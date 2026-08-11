@@ -703,11 +703,19 @@ def prepare_data(
     cache_indices: Optional[torch.Tensor] = None,
     has_initial_state: Optional[torch.Tensor] = None,
     conv_states: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
+    has_any_initial: Optional[bool] = None,
+    cu_seq_len: Optional[int] = None,
+    seqlens_cpu: Optional[list] = None,
 ):
     initial_states = (
         torch.index_select(conv_states, 0, cache_indices)
         * has_initial_state[:, None, None]
-        if has_initial_state is not None and has_initial_state.any()
+        if (
+            has_any_initial
+            if has_any_initial is not None
+            else (has_initial_state is not None and has_initial_state.any())
+        )
         else None
     )
 
@@ -718,17 +726,52 @@ def prepare_data(
 
     dtype, device = weight.dtype, weight.device
     batch_size = seqlens.size(0)
-    max_T = seqlens.max()
-    dim, cu_seq_len = x.size(0), query_start_loc[-1]
+    dim = x.size(0)
+    if seqlens_cpu is not None:
+        assert len(seqlens_cpu) == batch_size, f"{len(seqlens_cpu)=} != {batch_size=}"
+        # Host-known per-sequence lengths: max_T / cu_seq_len / indices are all
+        # built from CPU values so the whole path stays async (no D2H sync).
+        max_T = max(seqlens_cpu)
+        cu_seq_len_eff = sum(seqlens_cpu)
+    else:
+        # max_seq_len comes from the caller (CPU-known value) to avoid the
+        # GPU->host sync of ``seqlens.max()`` when there is a deep GPU queue.
+        max_T = max_seq_len if max_seq_len is not None else seqlens.max()
+        # cu_seq_len is the actual number of tokens (== query_start_loc[-1]); the
+        # caller supplies it as a CPU int to avoid the GPU->host sync of reading
+        # ``query_start_loc[-1]`` (fall back to x.size(1) for non-padded varlen x).
+        cu_seq_len_eff = (
+            cu_seq_len
+            if cu_seq_len is not None
+            else (x.size(1) if x.ndim == 2 else int(query_start_loc[-1]))
+        )
 
     x_flat = torch.zeros(size=(dim, batch_size * max_T), dtype=dtype, device=device)
 
-    base_idx = torch.arange(batch_size, device=device, dtype=torch.int32) * max_T
-    base_t = torch.arange(max_T, device=device, dtype=torch.int32).unsqueeze(0)
-    mask = base_t < seqlens.unsqueeze(1)
-    indices = (base_idx.unsqueeze(1) + base_t)[mask]
+    if seqlens_cpu is not None:
+        # Async per-seq copies; avoids the bool-mask indexing below, whose output
+        # length is host-dependent and forces a GPU->host sync.
+        start = 0
+        col_parts = []
+        for i, l in enumerate(seqlens_cpu):
+            if l > 0:
+                col_parts.append(
+                    torch.arange(i * max_T, i * max_T + l, device=device, dtype=torch.int32)
+                )
+                x_flat.index_copy_(1, col_parts[-1], x[:, start : start + l])
+            start += l
+        indices = (
+            torch.cat(col_parts)
+            if col_parts
+            else torch.zeros(0, dtype=torch.int32, device=device)
+        )
+    else:
+        base_idx = torch.arange(batch_size, device=device, dtype=torch.int32) * max_T
+        base_t = torch.arange(max_T, device=device, dtype=torch.int32).unsqueeze(0)
+        mask = base_t < seqlens.unsqueeze(1)
+        indices = (base_idx.unsqueeze(1) + base_t)[mask]
+        x_flat.index_copy_(1, indices, x[..., :cu_seq_len_eff])
 
-    x_flat.index_copy_(1, indices, x[..., :cu_seq_len])
     x_pad = x_flat.view(dim, batch_size, max_T).transpose(0, 1).contiguous()
 
     return x_pad, initial_states, seqlens, indices
@@ -744,6 +787,10 @@ def causal_conv1d_fn_npu(
     conv_states: Optional[torch.Tensor] = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    max_seq_len: Optional[int] = None,
+    has_any_initial: Optional[bool] = None,
+    cu_seq_len: Optional[int] = None,
+    seqlens_cpu: Optional[list] = None,
     **kwargs,
 ):
     """
@@ -781,10 +828,17 @@ def causal_conv1d_fn_npu(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
-    assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
-
     x_pad, initial_state_pad, seqlens, indices = prepare_data(
-        x, weight, query_start_loc, cache_indices, has_initial_state, conv_states
+        x,
+        weight,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        conv_states,
+        max_seq_len=max_seq_len,
+        has_any_initial=has_any_initial,
+        cu_seq_len=cu_seq_len,
+        seqlens_cpu=seqlens_cpu,
     )
 
     out, final_states_out = causal_conv1d_fn_native(
