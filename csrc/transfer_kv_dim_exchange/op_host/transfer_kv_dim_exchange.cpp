@@ -132,39 +132,105 @@ HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
     const aclrtMemcpyKind copy_kind =
         is_d2h ? aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST : aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE;
 
-    for (int64_t i = 0; i < num_pages; ++i) {
-        const int64_t device_page_index = device_idx[i * page_size] / page_size;
-        const int64_t host_page_index = host_idx[i * page_size] / page_size;
-        TORCH_CHECK(device_page_index >= 0 && device_page_index < device_pages_num,
+    // ---- Page-run transfer with run-length merging. ----
+    // Indices produced by the KV allocators are typically long contiguous runs
+    // on both sides. For a run of n pages that is contiguous on host AND device
+    // (host page p..p+n-1 and device page q..q+n-1), the per-page 2D copy
+    // (height=layers, dst strides across layers) can be transposed into a
+    // per-layer 2D copy (height=n, dst strides across contiguous device pages,
+    // src strides across host pages). This is mathematically equivalent but:
+    //   - reduces memcpy2d calls from n to `height` per run (e.g. 959 pages ->
+    //     78 calls when fully contiguous),
+    //   - makes the device side of each H2D task one large contiguous block,
+    //     which is friendlier to the DMA engine than layer-strided rows.
+    // Runs shorter than `height` fall back to the per-page form.
+    int64_t i = 0;
+    while (i < num_pages) {
+        const int64_t device_page0 = device_idx[i * page_size] / page_size;
+        const int64_t host_page0 = host_idx[i * page_size] / page_size;
+        TORCH_CHECK(device_page0 >= 0 && device_page0 < device_pages_num,
                     "device_page_index must be less than the 2nd dim of device_k");
-        TORCH_CHECK(host_page_index >= 0 && host_page_index < host_pages_num,
+        TORCH_CHECK(host_page0 >= 0 && host_page0 < host_pages_num,
                     "host_page_index must be less than the 1st dim of host_k");
 
-        char *device_k_ptr = device_k_base + layer_start * device_k_layer_pitch +
-                             device_page_index * device_k_page_pitch;
-        char *host_k_ptr = host_k_base + host_page_index * host_k_page_pitch +
-                           layer_start * host_k_layer_pitch;
-        if (is_d2h) {
-            aclrtMemcpy2dAsync(host_k_ptr, k_host_pitch, device_k_ptr, k_device_pitch, k_width, height,
-                               copy_kind, acl_stream);
-        } else {
-            aclrtMemcpy2dAsync(device_k_ptr, k_device_pitch, host_k_ptr, k_host_pitch, k_width, height,
-                               copy_kind, acl_stream);
+        int64_t run = 1;
+        while (i + run < num_pages &&
+               device_idx[(i + run) * page_size] == device_idx[(i + run - 1) * page_size] + page_size &&
+               host_idx[(i + run) * page_size] == host_idx[(i + run - 1) * page_size] + page_size) {
+            ++run;
         }
+        // Page continuity implies the last page index is device_page0 + run - 1.
+        TORCH_CHECK(device_page0 + run <= device_pages_num,
+                    "device page run exceeds the 2nd dim of device_k");
+        TORCH_CHECK(host_page0 + run <= host_pages_num,
+                    "host page run exceeds the 1st dim of host_k");
 
-        if (has_v) {
-            char *device_v_ptr = device_v_base + layer_start * device_v_layer_pitch +
-                                 device_page_index * device_v_page_pitch;
-            char *host_v_ptr = host_v_base + host_page_index * host_v_page_pitch +
-                               layer_start * host_v_layer_pitch;
-            if (is_d2h) {
-                aclrtMemcpy2dAsync(host_v_ptr, v_host_pitch, device_v_ptr, v_device_pitch, v_width, height,
-                                   copy_kind, acl_stream);
-            } else {
-                aclrtMemcpy2dAsync(device_v_ptr, v_device_pitch, host_v_ptr, v_host_pitch, v_width, height,
-                                   copy_kind, acl_stream);
+        if (run >= height) {
+            // Merged form: one 2D copy per layer, rows are pages.
+            // dst rows (H2D) walk contiguous device pages (pitch = one page of
+            // one layer); src rows walk host pages (pitch = one full host page
+            // = total_num_layers rows).
+            for (int64_t l = 0; l < height; ++l) {
+                char *device_k_ptr = device_k_base + (layer_start + l) * device_k_layer_pitch +
+                                     device_page0 * device_k_page_pitch;
+                char *host_k_ptr = host_k_base + host_page0 * host_k_page_pitch +
+                                   (layer_start + l) * host_k_layer_pitch;
+                if (is_d2h) {
+                    aclrtMemcpy2dAsync(host_k_ptr, host_k_page_pitch, device_k_ptr, device_k_page_pitch,
+                                       k_width, run, copy_kind, acl_stream);
+                } else {
+                    aclrtMemcpy2dAsync(device_k_ptr, device_k_page_pitch, host_k_ptr, host_k_page_pitch,
+                                       k_width, run, copy_kind, acl_stream);
+                }
+
+                if (has_v) {
+                    char *device_v_ptr = device_v_base + (layer_start + l) * device_v_layer_pitch +
+                                         device_page0 * device_v_page_pitch;
+                    char *host_v_ptr = host_v_base + host_page0 * host_v_page_pitch +
+                                       (layer_start + l) * host_v_layer_pitch;
+                    if (is_d2h) {
+                        aclrtMemcpy2dAsync(host_v_ptr, host_v_page_pitch, device_v_ptr, device_v_page_pitch,
+                                           v_width, run, copy_kind, acl_stream);
+                    } else {
+                        aclrtMemcpy2dAsync(device_v_ptr, device_v_page_pitch, host_v_ptr, host_v_page_pitch,
+                                           v_width, run, copy_kind, acl_stream);
+                    }
+                }
+            }
+        } else {
+            // Per-page form (existing behavior): one 2D copy per page, rows are layers.
+            for (int64_t j = 0; j < run; ++j) {
+                const int64_t device_page_index = device_page0 + j;
+                const int64_t host_page_index = host_page0 + j;
+
+                char *device_k_ptr = device_k_base + layer_start * device_k_layer_pitch +
+                                     device_page_index * device_k_page_pitch;
+                char *host_k_ptr = host_k_base + host_page_index * host_k_page_pitch +
+                                   layer_start * host_k_layer_pitch;
+                if (is_d2h) {
+                    aclrtMemcpy2dAsync(host_k_ptr, k_host_pitch, device_k_ptr, k_device_pitch, k_width, height,
+                                       copy_kind, acl_stream);
+                } else {
+                    aclrtMemcpy2dAsync(device_k_ptr, k_device_pitch, host_k_ptr, k_host_pitch, k_width, height,
+                                       copy_kind, acl_stream);
+                }
+
+                if (has_v) {
+                    char *device_v_ptr = device_v_base + layer_start * device_v_layer_pitch +
+                                         device_page_index * device_v_page_pitch;
+                    char *host_v_ptr = host_v_base + host_page_index * host_v_page_pitch +
+                                       layer_start * host_v_layer_pitch;
+                    if (is_d2h) {
+                        aclrtMemcpy2dAsync(host_v_ptr, v_host_pitch, device_v_ptr, v_device_pitch, v_width,
+                                           height, copy_kind, acl_stream);
+                    } else {
+                        aclrtMemcpy2dAsync(device_v_ptr, v_device_pitch, host_v_ptr, v_host_pitch, v_width,
+                                           height, copy_kind, acl_stream);
+                    }
+                }
             }
         }
+        i += run;
     }
 }
 
