@@ -337,5 +337,213 @@ class TestTransferKV(unittest.TestCase):
         )
 
 
+class TestTransferKVLayerRange(unittest.TestCase):
+    """Layer-group transfers (layer_start/layer_num and index_k_* ranges).
+
+    Each layer holds a distinct value so that a wrong layer offset, pitch or
+    height fails the per-layer assertions below (uniform values would hide it).
+    """
+
+    NUM_LAYERS = 16
+    NUM_INDEX_K_LAYERS = 6  # DSA-style: fewer indexer layers than total layers
+    NUM_PAGES = 4
+    PAGE_SIZE = 128
+    HEADS = 1
+    HEAD_DIM = 128
+
+    def _make_device_buffer(self, num_layers, fill):
+        buf = torch.zeros(
+            (num_layers, self.NUM_PAGES, self.PAGE_SIZE, self.HEADS, self.HEAD_DIM),
+            dtype=torch.bfloat16,
+            device="npu",
+        )
+        for layer in range(num_layers):
+            buf[layer].fill_(fill(layer))
+        return buf
+
+    def _make_host_buffer(self, num_layers):
+        return torch.zeros(
+            (self.NUM_PAGES, num_layers, self.PAGE_SIZE, self.HEADS, self.HEAD_DIM),
+            dtype=torch.bfloat16,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    def _transfer(
+        self,
+        direct: TransferDirection,
+        layer_start: int,
+        layer_num: int,
+        index_k_layer_start: int = None,
+        index_k_layer_num: int = None,
+    ):
+        torch.npu.set_device(0)
+
+        device_k = self._make_device_buffer(self.NUM_LAYERS, lambda l: l + 1)
+        device_v = self._make_device_buffer(self.NUM_LAYERS, lambda l: 100 + l + 1)
+        device_index_k = self._make_device_buffer(
+            self.NUM_INDEX_K_LAYERS, lambda l: 200 + l + 1
+        )
+        host_k = self._make_host_buffer(self.NUM_LAYERS)
+        host_v = self._make_host_buffer(self.NUM_LAYERS)
+        host_index_k = self._make_host_buffer(self.NUM_INDEX_K_LAYERS)
+
+        device_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        host_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+
+        stream = torch.npu.Stream()
+        with torch.npu.stream(stream):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=device_v,
+                host_v=host_v,
+                device_index_k=device_index_k,
+                host_index_k=host_index_k,
+                page_size=self.PAGE_SIZE,
+                direction=direct,
+                layer_start=layer_start,
+                layer_num=layer_num,
+                index_k_layer_start=index_k_layer_start,
+                index_k_layer_num=index_k_layer_num,
+            )
+        torch.npu.synchronize()
+        return (
+            device_k,
+            device_v,
+            device_index_k,
+            host_k,
+            host_v,
+            host_index_k,
+        )
+
+    def _check_d2h_range(self, host, num_layers, lo, hi, fill, base):
+        # host is (pages, layers, ...); transpose checks into layer-major.
+        host_layer_major = host.permute(1, 0, 2, 3, 4)
+        for layer in range(num_layers):
+            if lo <= layer < hi:
+                self.assertTrue(
+                    torch.all(
+                        torch.eq(host_layer_major[layer].cpu(), fill(layer))
+                    ),
+                    f"layer {layer} should have been transferred",
+                )
+            else:
+                self.assertTrue(
+                    torch.all(
+                        torch.eq(host_layer_major[layer].cpu(), base)
+                    ),
+                    f"layer {layer} should not have been transferred",
+                )
+
+    def test_layer_range_d2h(self):
+        _, _, _, host_k, host_v, _ = self._transfer(
+            TransferDirection.D2H, layer_start=3, layer_num=5
+        )
+        self._check_d2h_range(host_k, self.NUM_LAYERS, 3, 8, lambda l: l + 1, 0)
+        self._check_d2h_range(host_v, self.NUM_LAYERS, 3, 8, lambda l: 100 + l + 1, 0)
+
+    def test_layer_range_h2d(self):
+        # Prefill host with per-layer values, wipe device, transfer a group
+        # back and verify only that group moved.
+        torch.npu.set_device(0)
+        device_k = torch.zeros(
+            (self.NUM_LAYERS, self.NUM_PAGES, self.PAGE_SIZE, self.HEADS, self.HEAD_DIM),
+            dtype=torch.bfloat16,
+            device="npu",
+        )
+        host_k = self._make_host_buffer(self.NUM_LAYERS)
+        for layer in range(self.NUM_LAYERS):
+            host_k[:, layer].fill_(layer + 1)
+        device_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        host_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        with torch.npu.stream(torch.npu.Stream()):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+                layer_start=5,
+                layer_num=4,
+            )
+        torch.npu.synchronize()
+        device_k_cpu = device_k.cpu()
+        for layer in range(self.NUM_LAYERS):
+            expected = layer + 1 if 5 <= layer < 9 else 0
+            self.assertTrue(
+                torch.all(torch.eq(device_k_cpu[layer], expected)),
+                f"layer {layer} H2D content mismatch",
+            )
+
+    def test_index_k_layer_range_d2h(self):
+        # k/v group [3, 8) while index_k uses its own slot range [2, 5),
+        # mirroring DSA models where indexer layers live in a smaller space.
+        _, _, _, host_k, host_v, host_index_k = self._transfer(
+            TransferDirection.D2H,
+            layer_start=3,
+            layer_num=5,
+            index_k_layer_start=2,
+            index_k_layer_num=3,
+        )
+        self._check_d2h_range(host_k, self.NUM_LAYERS, 3, 8, lambda l: l + 1, 0)
+        self._check_d2h_range(host_v, self.NUM_LAYERS, 3, 8, lambda l: 100 + l + 1, 0)
+        self._check_d2h_range(
+            host_index_k, self.NUM_INDEX_K_LAYERS, 2, 5, lambda l: 200 + l + 1, 0
+        )
+
+    def test_index_k_layer_num_zero_skips_index_k(self):
+        # A k/v group containing no indexer layers: index_k must stay zero.
+        _, _, _, host_k, _, host_index_k = self._transfer(
+            TransferDirection.D2H,
+            layer_start=3,
+            layer_num=5,
+            index_k_layer_start=0,
+            index_k_layer_num=0,
+        )
+        self._check_d2h_range(host_k, self.NUM_LAYERS, 3, 8, lambda l: l + 1, 0)
+        self.assertTrue(
+            torch.all(torch.eq(host_index_k.cpu(), 0)),
+            "index_k should not be transferred when index_k_layer_num=0",
+        )
+
+    def test_layer_range_out_of_bounds_rejected(self):
+        torch.npu.set_device(0)
+        device_k = self._make_device_buffer(self.NUM_LAYERS, lambda l: 1)
+        host_k = self._make_host_buffer(self.NUM_LAYERS)
+        device_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        host_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        with self.assertRaises(RuntimeError):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+                layer_start=12,
+                layer_num=5,  # 12 + 5 > 16
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

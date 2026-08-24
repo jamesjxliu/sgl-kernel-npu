@@ -61,6 +61,10 @@ def transfer_kv_dim_exchange(
     page_size: int = 128,
     direction: TransferDirection = TransferDirection.H2D,
     flags: TransferFlag = TransferFlag.FAST2D,
+    layer_start: int = 0,
+    layer_num: int = -1,
+    index_k_layer_start: Optional[int] = None,
+    index_k_layer_num: Optional[int] = None,
 ):
     """
     In the L1 and L2 radix cache scenarios, perform batch copy of KV data between the device and the host.
@@ -79,6 +83,21 @@ def transfer_kv_dim_exchange(
         page_size: page size
         direction: only support H2D and D2H.
         flags: only FAST2D is supported, which indicates 2D data transfer via calling aclrtMemcpy2dAsync.
+        layer_start: first layer to transfer in the k/v layer space (dim 0 of
+            device_k / dim 1 of host_k). Defaults to 0. Used for layer-group
+            pipelining: a partial range makes the 2D copies cover only that
+            group of layers, so per-layer completion events recorded between
+            consecutive calls fire progressively.
+        layer_num: number of k/v layers to transfer. Negative means all
+            layers. Defaults to -1 (whole buffer, legacy behavior).
+        index_k_layer_start: first layer in the index_k/scale layer space.
+            Defaults to ``layer_start`` (identity mapping). DSA models store
+            indexer K (and its FP32 scale) in a separate, smaller layer space
+            (e.g. 21 indexer layers vs 78 total), so a partial k/v range must
+            map the indexer layers into their own slot range.
+        index_k_layer_num: number of index_k/scale layers to transfer.
+            Defaults to ``layer_num``. 0 skips the index_k/scale copies (the
+            k/v group contains no indexer layers).
     """
     torch.ops.npu.transfer_kv_dim_exchange(
         device_k,
@@ -90,8 +109,14 @@ def transfer_kv_dim_exchange(
         page_size,
         direction.value,
         flags.value,
+        layer_start,
+        layer_num,
     )
-    if device_index_k is not None and host_index_k is not None:
+    if index_k_layer_start is None:
+        index_k_layer_start = layer_start
+    if index_k_layer_num is None:
+        index_k_layer_num = layer_num
+    if device_index_k is not None and host_index_k is not None and index_k_layer_num != 0:
         torch.ops.npu.transfer_kv_dim_exchange(
             device_index_k,
             host_index_k,
@@ -102,8 +127,10 @@ def transfer_kv_dim_exchange(
             page_size,
             direction.value,
             flags.value,
+            index_k_layer_start,
+            index_k_layer_num,
         )
-    if device_index_k_scale is not None and host_index_k_scale is not None:
+    if device_index_k_scale is not None and host_index_k_scale is not None and index_k_layer_num != 0:
         # Device scale cache is 4-D (layers, pages, page_size, 1) while the host
         # cache is 5-D (pages, layers, page_size, 1, 1); the kernel requires both
         # operands to be 5-D, so pad the device operand with a trailing singleton.
@@ -119,6 +146,8 @@ def transfer_kv_dim_exchange(
             page_size,
             direction.value,
             flags.value,
+            index_k_layer_start,
+            index_k_layer_num,
         )
 
 

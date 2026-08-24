@@ -25,10 +25,16 @@ enum TransferDirection : int64_t {
 
 // @direction: only support 1 or 2, 1 is H2D, 2 is D2H
 // @flags: only support 2
+// @layer_start: first layer to transfer (dim 0 of device_* / dim 1 of host_*).
+//     Enables layer-group pipelining: callers split a full-buffer copy into
+//     per-group copies so that per-layer completion events recorded between
+//     consecutive calls fire progressively instead of only after the whole
+//     transfer.
+// @layer_num: number of layers to transfer; negative means all layers.
 HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k, at::Tensor &device_v,
                                        at::Tensor &host_v, const at::Tensor &device_indices,
                                        const at::Tensor &host_indices, int64_t page_size, int64_t direction,
-                                       int64_t flags)
+                                       int64_t flags, int64_t layer_start, int64_t layer_num)
 {
     TORCH_CHECK(device_k.numel() != 0, "device_k must not be empty");
     TORCH_CHECK(host_k.numel() != 0, "host_k must not be empty");
@@ -58,17 +64,23 @@ HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
     const int64_t device_pages_num = device_k.sizes()[1];
     const int64_t host_pages_num = host_k.sizes()[0];
     const int64_t total_num_layers = device_k.sizes()[0];
+    const int64_t height = layer_num < 0 ? total_num_layers : layer_num;
+    TORCH_CHECK(layer_start >= 0, "layer_start must be non-negative");
+    TORCH_CHECK(height > 0, "layer_num must be positive (or negative to transfer all layers)");
+    TORCH_CHECK(layer_start + height <= total_num_layers,
+                "layer_start + layer_num must not exceed the layer number of device_k");
     const auto heads_num = device_k.sizes()[3];
     const auto item_size = device_k.element_size();
     const auto k_head_dim = device_k.sizes()[4];
     const auto k_device_pitch = device_pages_num * page_size * heads_num * k_head_dim * item_size;
     const auto k_host_pitch = page_size * heads_num * k_head_dim * item_size;
     const auto k_width = page_size * heads_num * k_head_dim * item_size;
-    const auto v_head_dim = device_v.sizes()[4];
+    // device_v may be an empty tensor (e.g. FP8 packed KV); guard the
+    // sizes()[4] read so the pitches are only derived from a valid shape.
+    const auto v_head_dim = (device_v.numel() != 0 && host_v.numel() != 0) ? device_v.sizes()[4] : 0;
     const auto v_device_pitch = device_pages_num * page_size * heads_num * v_head_dim * item_size;
     const auto v_host_pitch = page_size * heads_num * v_head_dim * item_size;
     const auto v_width = page_size * heads_num * v_head_dim * item_size;
-    const auto height = total_num_layers;
     c10_npu::NPUStream current_stream = c10_npu::getCurrentNPUStream();
     aclrtStream acl_stream = current_stream.stream();
 
@@ -80,8 +92,10 @@ HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
                     "device_page_index must be less than the 2nd dim of device_k");
         TORCH_CHECK(host_page_index < host_k.sizes()[0], "host_page_index must be less than the 1st dim of host_k");
 
-        void *device_k_ptr = reinterpret_cast<void *>(device_k[0][device_page_index].data_ptr());
-        void *host_k_ptr = reinterpret_cast<void *>(host_k[host_page_index][0].data_ptr());
+        void *device_k_ptr =
+            reinterpret_cast<void *>(device_k[layer_start][device_page_index].data_ptr());
+        void *host_k_ptr =
+            reinterpret_cast<void *>(host_k[host_page_index][layer_start].data_ptr());
         if (direction == static_cast<int64_t>(TransferDirection::D2H)) {
             aclrtMemcpy2dAsync(host_k_ptr, k_host_pitch, device_k_ptr, k_device_pitch, k_width, height,
                                aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST, acl_stream);
@@ -91,8 +105,10 @@ HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
         }
 
         if (device_v.numel() != 0 && host_v.numel() != 0) {
-            void *device_v_ptr = reinterpret_cast<void *>(device_v[0][device_page_index].data_ptr());
-            void *host_v_ptr = reinterpret_cast<void *>(host_v[host_page_index][0].data_ptr());
+            void *device_v_ptr =
+                reinterpret_cast<void *>(device_v[layer_start][device_page_index].data_ptr());
+            void *host_v_ptr =
+                reinterpret_cast<void *>(host_v[host_page_index][layer_start].data_ptr());
             if (direction == static_cast<int64_t>(TransferDirection::D2H)) {
                 aclrtMemcpy2dAsync(host_v_ptr, v_host_pitch, device_v_ptr, v_device_pitch, v_width, height,
                                    aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST, acl_stream);
