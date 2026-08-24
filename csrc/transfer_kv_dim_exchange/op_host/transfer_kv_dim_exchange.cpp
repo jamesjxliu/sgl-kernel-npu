@@ -85,36 +85,84 @@ HOST_API void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
     aclrtStream acl_stream = current_stream.stream();
 
     const int64_t num_pages = device_indices.size(0) / page_size;
-    for (const auto i : c10::irange(num_pages)) {
-        auto device_page_index = device_indices_cpu[i * page_size].item<int64_t>() / page_size;
-        auto host_page_index = host_indices_cpu[i * page_size].item<int64_t>() / page_size;
-        TORCH_CHECK(device_page_index < device_k.sizes()[1],
-                    "device_page_index must be less than the 2nd dim of device_k");
-        TORCH_CHECK(host_page_index < host_k.sizes()[0], "host_page_index must be less than the 1st dim of host_k");
+    TORCH_CHECK(device_indices.scalar_type() == at::kLong, "device_indices must be int64");
+    TORCH_CHECK(host_indices.scalar_type() == at::kLong, "host_indices must be int64");
 
-        void *device_k_ptr =
-            reinterpret_cast<void *>(device_k[layer_start][device_page_index].data_ptr());
-        void *host_k_ptr =
-            reinterpret_cast<void *>(host_k[host_page_index][layer_start].data_ptr());
-        if (direction == static_cast<int64_t>(TransferDirection::D2H)) {
+    // ---- Hoist all loop-invariant addressing out of the page loop. ----
+    // Per-page addresses are computed as base + offset from the base pointers
+    // and element strides, avoiding per-page at::Tensor indexing (which
+    // materializes temporary TensorImpls) and per-page .item() dispatches.
+    // stride() * item_size also stays correct for sliced views (data_ptr()
+    // already carries the storage offset), unlike offsets derived from sizes.
+    const int64_t *device_idx = device_indices_cpu.data_ptr<int64_t>();
+    const int64_t *host_idx = host_indices_cpu.data_ptr<int64_t>();
+
+    // device_* layout: (layer, page, page_size, heads, head_dim)
+    // host_* layout:  (page, layer, page_size, heads, head_dim)
+    char *device_k_base = static_cast<char *>(device_k.data_ptr());
+    char *host_k_base = static_cast<char *>(host_k.data_ptr());
+    const int64_t device_k_layer_pitch = device_k.stride(0) * item_size;
+    const int64_t device_k_page_pitch = device_k.stride(1) * item_size;
+    const int64_t host_k_page_pitch = host_k.stride(0) * item_size;
+    const int64_t host_k_layer_pitch = host_k.stride(1) * item_size;
+    // The innermost three dims (page_size, heads, head_dim) must be one
+    // contiguous block so that a 2D row of the memcpy is a flat copy.
+    TORCH_CHECK(device_k.stride(1) == page_size * heads_num * k_head_dim,
+                "device_k innermost dims must be contiguous");
+    TORCH_CHECK(host_k.stride(1) == page_size * heads_num * k_head_dim,
+                "host_k innermost dims must be contiguous");
+
+    const bool has_v = device_v.numel() != 0 && host_v.numel() != 0;
+    char *device_v_base = has_v ? static_cast<char *>(device_v.data_ptr()) : nullptr;
+    char *host_v_base = has_v ? static_cast<char *>(host_v.data_ptr()) : nullptr;
+    int64_t device_v_layer_pitch = 0, device_v_page_pitch = 0;
+    int64_t host_v_page_pitch = 0, host_v_layer_pitch = 0;
+    if (has_v) {
+        device_v_layer_pitch = device_v.stride(0) * item_size;
+        device_v_page_pitch = device_v.stride(1) * item_size;
+        host_v_page_pitch = host_v.stride(0) * item_size;
+        host_v_layer_pitch = host_v.stride(1) * item_size;
+        TORCH_CHECK(device_v.stride(1) == page_size * heads_num * v_head_dim,
+                    "device_v innermost dims must be contiguous");
+        TORCH_CHECK(host_v.stride(1) == page_size * heads_num * v_head_dim,
+                    "host_v innermost dims must be contiguous");
+    }
+
+    const bool is_d2h = direction == static_cast<int64_t>(TransferDirection::D2H);
+    const aclrtMemcpyKind copy_kind =
+        is_d2h ? aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST : aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE;
+
+    for (int64_t i = 0; i < num_pages; ++i) {
+        const int64_t device_page_index = device_idx[i * page_size] / page_size;
+        const int64_t host_page_index = host_idx[i * page_size] / page_size;
+        TORCH_CHECK(device_page_index >= 0 && device_page_index < device_pages_num,
+                    "device_page_index must be less than the 2nd dim of device_k");
+        TORCH_CHECK(host_page_index >= 0 && host_page_index < host_pages_num,
+                    "host_page_index must be less than the 1st dim of host_k");
+
+        char *device_k_ptr = device_k_base + layer_start * device_k_layer_pitch +
+                             device_page_index * device_k_page_pitch;
+        char *host_k_ptr = host_k_base + host_page_index * host_k_page_pitch +
+                           layer_start * host_k_layer_pitch;
+        if (is_d2h) {
             aclrtMemcpy2dAsync(host_k_ptr, k_host_pitch, device_k_ptr, k_device_pitch, k_width, height,
-                               aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST, acl_stream);
+                               copy_kind, acl_stream);
         } else {
             aclrtMemcpy2dAsync(device_k_ptr, k_device_pitch, host_k_ptr, k_host_pitch, k_width, height,
-                               aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE, acl_stream);
+                               copy_kind, acl_stream);
         }
 
-        if (device_v.numel() != 0 && host_v.numel() != 0) {
-            void *device_v_ptr =
-                reinterpret_cast<void *>(device_v[layer_start][device_page_index].data_ptr());
-            void *host_v_ptr =
-                reinterpret_cast<void *>(host_v[host_page_index][layer_start].data_ptr());
-            if (direction == static_cast<int64_t>(TransferDirection::D2H)) {
+        if (has_v) {
+            char *device_v_ptr = device_v_base + layer_start * device_v_layer_pitch +
+                                 device_page_index * device_v_page_pitch;
+            char *host_v_ptr = host_v_base + host_page_index * host_v_page_pitch +
+                               layer_start * host_v_layer_pitch;
+            if (is_d2h) {
                 aclrtMemcpy2dAsync(host_v_ptr, v_host_pitch, device_v_ptr, v_device_pitch, v_width, height,
-                                   aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST, acl_stream);
+                                   copy_kind, acl_stream);
             } else {
                 aclrtMemcpy2dAsync(device_v_ptr, v_device_pitch, host_v_ptr, v_host_pitch, v_width, height,
-                                   aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE, acl_stream);
+                                   copy_kind, acl_stream);
             }
         }
     }
