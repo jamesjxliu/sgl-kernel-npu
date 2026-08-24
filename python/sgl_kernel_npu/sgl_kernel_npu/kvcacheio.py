@@ -151,6 +151,85 @@ def transfer_kv_dim_exchange(
         )
 
 
+def transfer_kv_dim_exchange_table(
+    device_indices: torch.Tensor,
+    host_indices: torch.Tensor,
+    device_k: torch.Tensor,
+    host_k: torch.Tensor,
+    device_v: Optional[torch.Tensor] = None,
+    host_v: Optional[torch.Tensor] = None,
+    device_index_k: Optional[torch.Tensor] = None,
+    host_index_k: Optional[torch.Tensor] = None,
+    device_index_k_scale: Optional[torch.Tensor] = None,
+    host_index_k_scale: Optional[torch.Tensor] = None,
+    page_size: int = 128,
+    direction: TransferDirection = TransferDirection.H2D,
+    layer_start: int = 0,
+    layer_num: int = -1,
+    index_k_layer_start: int = 0,
+    index_k_layer_num: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build a flat (src, dst, len) entry table for the Memfabric acc_offload
+    AIV sparse-copy kernel, covering the same page_first <-> layer_first
+    transpose as transfer_kv_dim_exchange but as one entry per (page, layer)
+    row of every component (k/v/index_k/scale).  Rows wider than 88KB are
+    split to fit the AIV KV-copy kernel's UB double-buffer.
+
+    The host-side buffers must be hybm-backed (memfabric offload.empty) since
+    the AIV kernel de-references the host virtual addresses directly.
+
+    Args:
+        layer_start: first k/v layer to cover (dim 0 of device_k / dim 1 of
+            host_k). Defaults to 0.
+        layer_num: number of k/v layers to cover. Negative means all layers.
+            Used for layer-group pipelining: consecutive calls cover
+            successive groups so per-group completion events overlap DMA with
+            compute.
+        index_k_layer_start: first layer in the index_k/scale layer space
+            (the slot space of the smaller indexer layer set, e.g. 21 of 78
+            layers for GLM 5.2 DSA). Defaults to 0.
+        index_k_layer_num: number of index_k/scale layers to cover. Negative
+            means all; 0 skips the index_k/scale components (the k/v group
+            contains no indexer layers).
+
+    Returns:
+        (src_ptrs int64[N], dst_ptrs int64[N], lens int32[N], size int32[1])
+        device tensors ready for offload.sparse_copy.
+    """
+    empty = torch.empty(0, dtype=torch.int64, device=device_k.device)
+    if device_v is None or host_v is None:
+        device_v, host_v = empty, empty
+    if device_index_k is None or host_index_k is None:
+        device_index_k, host_index_k = empty, empty
+    if device_index_k_scale is None or host_index_k_scale is None:
+        device_index_k_scale, host_index_k_scale = empty, empty
+    else:
+        # Device scale cache is 4-D (layers, pages, page_size, 1) while the
+        # host cache is 5-D (pages, layers, page_size, 1, 1); the table op
+        # requires both operands to be 5-D, so pad the device operand.
+        if device_index_k_scale.dim() == 4:
+            device_index_k_scale = device_index_k_scale.unsqueeze(-1)
+    return torch.ops.npu.transfer_kv_dim_exchange_table(
+        device_k,
+        host_k,
+        device_v,
+        host_v,
+        device_index_k,
+        host_index_k,
+        device_index_k_scale,
+        host_index_k_scale,
+        device_indices,
+        host_indices,
+        page_size,
+        direction.value,
+        layer_start,
+        layer_num,
+        index_k_layer_start,
+        index_k_layer_num,
+    )
+
+
 def transfer_mamba_state(
     device_buf: torch.Tensor,
     host_buf: torch.Tensor,

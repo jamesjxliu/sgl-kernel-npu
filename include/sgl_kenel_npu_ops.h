@@ -53,6 +53,27 @@ void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
                               int64_t direction, int64_t flags,
                               int64_t layer_start, int64_t layer_num);
 
+// Build a flat (src, dst, len) entry table covering every (page, layer) row
+// of the k/v/index_k/index_k_scale components, for the acc_offload AIV
+// sparse-copy kernel (offload.sparse_copy).  Entries larger than the AIV
+// kernel's 88KB UB double-buffer are split.  Returns (src_ptrs int64[N],
+// dst_ptrs int64[N], lens int32[N], size int32[1]) on the device of device_k.
+// Layer-group pipelining: the k/v components cover
+// [layer_start, layer_start + layer_num) (layer_num < 0 = all layers) and the
+// index_k/scale components cover [index_k_layer_start, index_k_layer_start +
+// index_k_layer_num) of the separate indexer layer space (num < 0 = all,
+// 0 = skip those components), so callers can interleave table builds +
+// sparse_copy launches per layer group.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+transfer_kv_dim_exchange_table(const at::Tensor &device_k, const at::Tensor &host_k,
+                               const at::Tensor &device_v, const at::Tensor &host_v,
+                               const at::Tensor &device_index_k, const at::Tensor &host_index_k,
+                               const at::Tensor &device_index_k_scale, const at::Tensor &host_index_k_scale,
+                               const at::Tensor &device_indices, const at::Tensor &host_indices,
+                               int64_t page_size, int64_t direction,
+                               int64_t layer_start, int64_t layer_num,
+                               int64_t index_k_layer_start, int64_t index_k_layer_num);
+
 void transfer_mamba_state(at::Tensor &device_buf, at::Tensor &host_buf,
                           const at::Tensor &device_indices,
                           const at::Tensor &host_indices, int64_t direction);

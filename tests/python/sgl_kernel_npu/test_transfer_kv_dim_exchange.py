@@ -8,6 +8,16 @@ from sgl_kernel_npu.kvcacheio import (
     transfer_kv_dim_exchange,
 )
 
+try:
+    from sgl_kernel_npu.kvcacheio import transfer_kv_dim_exchange_table
+except ImportError:
+    transfer_kv_dim_exchange_table = None
+
+try:
+    from memfabric_hybrid import offload as _mf_offload
+except ImportError:
+    _mf_offload = None
+
 # example comes from Qwen3-32B, TP=2
 TP = 2
 NUM_KV_HEADS = 8
@@ -543,6 +553,711 @@ class TestTransferKVLayerRange(unittest.TestCase):
                 layer_start=12,
                 layer_num=5,  # 12 + 5 > 16
             )
+
+
+class TestTransferKVRunMerge(unittest.TestCase):
+    """Contiguous page-run merging (full-layer, one-shot transfers).
+
+    When host and device page indices are contiguous, the kernel merges the
+    per-page 2D copies into per-layer 2D copies. These tests force both paths:
+    long runs (>= layers) take the merged form, short runs fall back to the
+    per-page form. Every (layer, page) holds a distinct value so a wrong
+    page/layer pitch or run boundary fails the element-wise checks (uniform
+    values would hide it), and untouched pages must stay zero (catches
+    out-of-run writes from bad strides).
+    """
+
+    NUM_LAYERS = 16
+    NUM_PAGES = 96  # > NUM_LAYERS so contiguous arange indices take the merged path
+    PAGE_SIZE = 128
+    HEADS = 1
+    HEAD_DIM = 64
+
+    def _value(self, layer, page):
+        # Distinct per (layer, page); float32 keeps it exact.
+        return float((layer + 1) * 1000 + page)
+
+    def _make_buffers(self):
+        device_k = torch.zeros(
+            (self.NUM_LAYERS, self.NUM_PAGES, self.PAGE_SIZE, self.HEADS, self.HEAD_DIM),
+            dtype=torch.float32,
+            device="npu",
+        )
+        host_k = torch.zeros(
+            (self.NUM_PAGES, self.NUM_LAYERS, self.PAGE_SIZE, self.HEADS, self.HEAD_DIM),
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=True,
+        )
+        return device_k, host_k
+
+    def _fill_device(self, device_k):
+        for layer in range(self.NUM_LAYERS):
+            for page in range(self.NUM_PAGES):
+                device_k[layer, page].fill_(self._value(layer, page))
+
+    def _fill_host(self, host_k):
+        for layer in range(self.NUM_LAYERS):
+            for page in range(self.NUM_PAGES):
+                host_k[page, layer].fill_(self._value(layer, page))
+
+    def _check_host(self, host_k, covered_pages):
+        host_cpu = host_k.cpu()
+        for page in range(self.NUM_PAGES):
+            for layer in range(self.NUM_LAYERS):
+                expected = self._value(layer, page) if page in covered_pages else 0.0
+                if not torch.all(torch.eq(host_cpu[page, layer], expected)):
+                    self.fail(f"host[{page}, {layer}] mismatch after D2H run transfer")
+
+    def _check_device(self, device_k, covered_pages):
+        device_cpu = device_k.cpu()
+        for layer in range(self.NUM_LAYERS):
+            for page in range(self.NUM_PAGES):
+                expected = self._value(layer, page) if page in covered_pages else 0.0
+                if not torch.all(torch.eq(device_cpu[layer, page], expected)):
+                    self.fail(f"device[{layer}, {page}] mismatch after H2D run transfer")
+
+    def test_contiguous_run_merged_d2h(self):
+        torch.npu.set_device(0)
+        device_k, host_k = self._make_buffers()
+        self._fill_device(device_k)
+        indices = torch.arange(self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64)
+        with torch.npu.stream(torch.npu.Stream()):
+            transfer_kv_dim_exchange(
+                device_indices=indices,
+                host_indices=indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.D2H,
+            )
+        torch.npu.synchronize()
+        self._check_host(host_k, set(range(self.NUM_PAGES)))
+
+    def test_contiguous_run_merged_h2d(self):
+        torch.npu.set_device(0)
+        device_k, host_k = self._make_buffers()
+        self._fill_host(host_k)
+        indices = torch.arange(self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64)
+        with torch.npu.stream(torch.npu.Stream()):
+            transfer_kv_dim_exchange(
+                device_indices=indices,
+                host_indices=indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+            )
+        torch.npu.synchronize()
+        self._check_device(device_k, set(range(self.NUM_PAGES)))
+
+    def _segment_indices(self, segments):
+        """Build token-level indices from (host_page0, device_page0, n) segments."""
+        device_idx, host_idx = [], []
+        for host_p0, dev_p0, n in segments:
+            host_idx.extend(range(host_p0 * self.PAGE_SIZE, (host_p0 + n) * self.PAGE_SIZE))
+            device_idx.extend(range(dev_p0 * self.PAGE_SIZE, (dev_p0 + n) * self.PAGE_SIZE))
+        return (
+            torch.tensor(device_idx, dtype=torch.int64),
+            torch.tensor(host_idx, dtype=torch.int64),
+        )
+
+    def test_mixed_segments_d2h(self):
+        # Two long runs (32 and 24 pages >= 16 layers -> merged form) and two
+        # short runs (2 pages < 16 -> per-page fallback), with host/device page
+        # offsets deliberately different inside each run.
+        torch.npu.set_device(0)
+        segments = [
+            (0, 64, 32),   # merged
+            (40, 0, 2),    # fallback
+            (60, 8, 24),   # merged
+            (90, 2, 2),    # fallback
+        ]
+        covered_host_pages = set()
+        for host_p0, _, n in segments:
+            covered_host_pages.update(range(host_p0, host_p0 + n))
+
+        device_k, host_k = self._make_buffers()
+        self._fill_device(device_k)
+        device_indices, host_indices = self._segment_indices(segments)
+        with torch.npu.stream(torch.npu.Stream()):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.D2H,
+            )
+        torch.npu.synchronize()
+        self._check_host(host_k, covered_host_pages)
+
+    def test_mixed_segments_h2d(self):
+        torch.npu.set_device(0)
+        segments = [
+            (0, 64, 32),
+            (40, 0, 2),
+            (60, 8, 24),
+            (90, 2, 2),
+        ]
+        covered_device_pages = set()
+        for _, dev_p0, n in segments:
+            covered_device_pages.update(range(dev_p0, dev_p0 + n))
+
+        device_k, host_k = self._make_buffers()
+        self._fill_host(host_k)
+        device_indices, host_indices = self._segment_indices(segments)
+        with torch.npu.stream(torch.npu.Stream()):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+            )
+        torch.npu.synchronize()
+        self._check_device(device_k, covered_device_pages)
+
+    def test_run_exceeding_pages_rejected(self):
+        torch.npu.set_device(0)
+        device_k, host_k = self._make_buffers()
+        # A run that runs past the end of the device page space must fail the
+        # bounds check: last 8 device pages starting at 90 would end at 97 > 96.
+        segments = [(0, 90, 8)]
+        device_indices, host_indices = self._segment_indices(segments)
+        with self.assertRaises(RuntimeError):
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=torch.empty(0),
+                host_v=torch.empty(0),
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+            )
+
+
+class TestTransferKVAscendCTable(unittest.TestCase):
+    """acc_offload AIV sparse-copy path (transfer_kv_dim_exchange_table +
+    offload.sparse_copy) vs the legacy memcpy2d path.
+
+    The AIV kernel de-references host pointers directly, so its host pool is
+    hybm-backed (offload.empty); the reference path uses ordinary pinned
+    memory.  Both an A/B comparison against the memcpy2d result and an
+    absolute per-(layer, page) value check are performed, with a shuffled
+    host page mapping so wrong page/layer pitches cannot cancel out.
+    """
+
+    NUM_LAYERS = 8
+    INDEX_LAYERS = 3  # DSA-style: fewer indexer layers than k/v layers
+    NUM_PAGES = 16
+    PAGE_SIZE = 128
+    K_WIDTH = 64
+    V_WIDTH = 32
+    INDEX_WIDTH = 128
+    ONE_GB = 1 << 30
+
+    def _value(self, layer, page):
+        # Distinct and exact in bf16 (integers < 256).
+        return float(layer * 17 + page + 1)
+
+    @classmethod
+    def _reserve_bytes(cls):
+        ps = cls.PAGE_SIZE
+        return (
+            cls.NUM_PAGES
+            * ps
+            * (
+                cls.NUM_LAYERS * (cls.K_WIDTH + cls.V_WIDTH)
+                + cls.INDEX_LAYERS * cls.INDEX_WIDTH
+            )
+            * 2
+            + cls.NUM_PAGES * ps * cls.INDEX_LAYERS * 4  # FP32 scale
+        )
+
+    @classmethod
+    def setUpClass(cls):
+        if _mf_offload is None:
+            raise unittest.SkipTest("memfabric_hybrid is not installed")
+        if transfer_kv_dim_exchange_table is None:
+            raise unittest.SkipTest(
+                "transfer_kv_dim_exchange_table is unavailable; rebuild sgl-kernel-npu"
+            )
+        torch.npu.set_device(0)
+        cls.offload = _mf_offload
+        reserve = max(cls.ONE_GB, ((cls._reserve_bytes() + cls.ONE_GB - 1) // cls.ONE_GB) * cls.ONE_GB)
+        config = _mf_offload.OffloadConfig()
+        config.device_id = 0
+        config.reserve_size = reserve
+        config.alloc_size = reserve
+        assert _mf_offload.initialize(config) == 0, "offload.initialize failed"
+        cls.buffers = None  # allocated per test to control lifetimes
+
+    @classmethod
+    def tearDownClass(cls):
+        if _mf_offload is not None and cls.offload is _mf_offload:
+            cls.buffers = None
+            _mf_offload.uninitialize()
+
+    # -- buffers ----------------------------------------------------------
+    def _alloc(self):
+        ps, L, IL, P = self.PAGE_SIZE, self.NUM_LAYERS, self.INDEX_LAYERS, self.NUM_PAGES
+        dev = lambda layers, width, dtype=torch.bfloat16: torch.zeros(
+            (layers, P, ps, 1, width), dtype=dtype, device="npu"
+        )
+        hyb = lambda layers, width, dtype=torch.bfloat16: self.offload.empty(
+            [P, layers, ps, 1, width], dtype=dtype
+        ).zero_()
+        pin = lambda layers, width, dtype=torch.bfloat16: torch.zeros(
+            (P, layers, ps, 1, width), dtype=dtype, device="cpu", pin_memory=True
+        )
+        self.buffers = {
+            "device_k": dev(L, self.K_WIDTH),
+            "device_v": dev(L, self.V_WIDTH),
+            "device_index_k": dev(IL, self.INDEX_WIDTH),
+            "device_scale": torch.zeros((IL, P, ps, 1), dtype=torch.float32, device="npu"),
+            "host_k": hyb(L, self.K_WIDTH),
+            "host_v": hyb(L, self.V_WIDTH),
+            "host_index_k": hyb(IL, self.INDEX_WIDTH),
+            "host_scale": hyb(IL, 1, torch.float32),
+            "ref_k": pin(L, self.K_WIDTH),
+            "ref_v": pin(L, self.V_WIDTH),
+            "ref_index_k": pin(IL, self.INDEX_WIDTH),
+            "ref_scale": pin(IL, 1, torch.float32),
+        }
+
+    def _indices(self):
+        # device page i maps to host page perm[i]; token-level expansion.
+        g = torch.Generator().manual_seed(7)
+        perm = torch.randperm(self.NUM_PAGES, generator=g)
+        host_tokens = (
+            (perm * self.PAGE_SIZE).repeat_interleave(self.PAGE_SIZE)
+            + torch.arange(self.PAGE_SIZE).repeat(self.NUM_PAGES)
+        )
+        device_indices = torch.arange(
+            self.NUM_PAGES * self.PAGE_SIZE, dtype=torch.int64
+        )
+        return device_indices, host_tokens.to(device_indices.device), perm
+
+    # -- transfer helpers --------------------------------------------------
+    def _run_memcpy2d(self, bufs, direction, host_key_prefix="ref"):
+        transfer_kv_dim_exchange(
+            device_indices=bufs["device_indices"],
+            host_indices=bufs["host_indices"],
+            device_k=bufs["device_k"],
+            host_k=bufs[f"{host_key_prefix}_k"],
+            device_v=bufs["device_v"],
+            host_v=bufs[f"{host_key_prefix}_v"],
+            device_index_k=bufs["device_index_k"],
+            host_index_k=bufs[f"{host_key_prefix}_index_k"],
+            device_index_k_scale=bufs["device_scale"],
+            host_index_k_scale=bufs[f"{host_key_prefix}_scale"],
+            page_size=self.PAGE_SIZE,
+            direction=direction,
+        )
+
+    def _run_aiv(self, bufs, direction):
+        src, dst, lens, size = transfer_kv_dim_exchange_table(
+            device_indices=bufs["device_indices"],
+            host_indices=bufs["host_indices"],
+            device_k=bufs["device_k"],
+            host_k=bufs["host_k"],
+            device_v=bufs["device_v"],
+            host_v=bufs["host_v"],
+            device_index_k=bufs["device_index_k"],
+            host_index_k=bufs["host_index_k"],
+            device_index_k_scale=bufs["device_scale"],
+            host_index_k_scale=bufs["host_scale"],
+            page_size=self.PAGE_SIZE,
+            direction=direction,
+        )
+        device = torch.device("npu", torch.npu.current_device())
+        ret = self.offload.sparse_copy(src, dst, lens, size, device)
+        self.assertEqual(ret, 0, "offload.sparse_copy failed")
+        stream = torch.npu.current_stream()
+        for t in (src, dst, lens, size):
+            t.record_stream(stream)
+
+    # -- checks ------------------------------------------------------------
+    def _fill_device(self, bufs):
+        for key, layers in (
+            ("device_k", self.NUM_LAYERS),
+            ("device_v", self.NUM_LAYERS),
+            ("device_index_k", self.INDEX_LAYERS),
+            ("device_scale", self.INDEX_LAYERS),
+        ):
+            for layer in range(layers):
+                for page in range(self.NUM_PAGES):
+                    bufs[key][layer, page].fill_(self._value(layer, page))
+
+    def _fill_host(self, bufs):
+        perm = bufs["perm"].tolist()
+        for key, layers in (
+            ("host_k", self.NUM_LAYERS),
+            ("host_v", self.NUM_LAYERS),
+            ("host_index_k", self.INDEX_LAYERS),
+            ("host_scale", self.INDEX_LAYERS),
+        ):
+            for layer in range(layers):
+                for dp, hp in enumerate(perm):
+                    bufs[key][hp, layer].fill_(self._value(layer, dp))
+
+    def _check_host_absolute(self, host, layers, label):
+        # host[perm[dp], layer] must equal value(layer, dp) everywhere.
+        perm = self.buffers["perm"].tolist()
+        for layer in range(layers):
+            for dp in range(self.NUM_PAGES):
+                expect = self._value(layer, dp)
+                got = host[perm[dp], layer]
+                self.assertTrue(
+                    torch.all(torch.eq(got, expect)),
+                    f"{label} mismatch at layer={layer} page={dp}",
+                )
+
+    def _check_device_absolute(self, device, layers, label):
+        cpu = device.cpu()
+        for layer in range(layers):
+            for page in range(self.NUM_PAGES):
+                expect = self._value(layer, page)
+                self.assertTrue(
+                    torch.all(torch.eq(cpu[layer, page], expect)),
+                    f"{label} mismatch at layer={layer} page={page}",
+                )
+
+    # -- tests --------------------------------------------------------------
+    def test_d2h_aiv_matches_memcpy2d(self):
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        self._fill_device(self.buffers)
+        self._run_memcpy2d(self.buffers, TransferDirection.D2H)
+        torch.npu.synchronize()
+        # Absolute check on the reference path, then wipe and run AIV.
+        for key, layers in (
+            ("ref_k", self.NUM_LAYERS),
+            ("ref_v", self.NUM_LAYERS),
+            ("ref_index_k", self.INDEX_LAYERS),
+            ("ref_scale", self.INDEX_LAYERS),
+        ):
+            self._check_host_absolute(self.buffers[key], layers, key)
+        for key in ("host_k", "host_v", "host_index_k", "host_scale"):
+            self.buffers[key].zero_()
+
+        self._run_aiv(self.buffers, TransferDirection.D2H)
+        torch.npu.synchronize()
+        for hyb, ref in (
+            ("host_k", "ref_k"),
+            ("host_v", "ref_v"),
+            ("host_index_k", "ref_index_k"),
+            ("host_scale", "ref_scale"),
+        ):
+            self.assertTrue(
+                torch.equal(self.buffers[hyb], self.buffers[ref]),
+                f"AIV D2H result differs from memcpy2d for {hyb}",
+            )
+
+    def test_h2d_aiv_matches_memcpy2d(self):
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        # Fill the hybm host pool; reference: memcpy2d into wiped device
+        # buffers (fresh copies), then wipe again and run AIV.
+        self._fill_host(self.buffers)
+        # Both paths read the same hybm host pool as the H2D source.
+        self._run_memcpy2d(self.buffers, TransferDirection.H2D, host_key_prefix="host")
+        torch.npu.synchronize()
+        # Absolute check on the reference path, then wipe and run AIV.
+        for key, layers in (
+            ("device_k", self.NUM_LAYERS),
+            ("device_v", self.NUM_LAYERS),
+            ("device_index_k", self.INDEX_LAYERS),
+            ("device_scale", self.INDEX_LAYERS),
+        ):
+            self._check_device_absolute(self.buffers[key], layers, key)
+        ref = {
+            k: self.buffers[k].detach().cpu().clone()
+            for k in ("device_k", "device_v", "device_index_k", "device_scale")
+        }
+        for k in ("device_k", "device_v", "device_index_k", "device_scale"):
+            self.buffers[k].zero_()
+
+        self._run_aiv(self.buffers, TransferDirection.H2D)
+        torch.npu.synchronize()
+        for k, ref_t in ref.items():
+            self.assertTrue(
+                torch.equal(self.buffers[k].cpu(), ref_t),
+                f"AIV H2D result differs from memcpy2d for {k}",
+            )
+
+    def test_table_entry_count_and_split(self):
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        src, dst, lens, size = transfer_kv_dim_exchange_table(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=self.buffers["device_k"],
+            host_k=self.buffers["host_k"],
+            device_v=self.buffers["device_v"],
+            host_v=self.buffers["host_v"],
+            device_index_k=self.buffers["device_index_k"],
+            host_index_k=self.buffers["host_index_k"],
+            device_index_k_scale=self.buffers["device_scale"],
+            host_index_k_scale=self.buffers["host_scale"],
+            page_size=self.PAGE_SIZE,
+            direction=TransferDirection.D2H,
+        )
+        P, L, IL = self.NUM_PAGES, self.NUM_LAYERS, self.INDEX_LAYERS
+        # No row exceeds 88KB with these widths, so no entry is split.
+        expected = P * L + P * L + P * IL + P * IL  # k + v + index_k + scale
+        self.assertEqual(int(size.cpu().item()), expected)
+        self.assertEqual(src.numel(), expected)
+        self.assertEqual(dst.numel(), expected)
+        self.assertEqual(lens.numel(), expected)
+        # Row widths per component (bytes): k, v, index_k, scale.
+        w = lambda width, itemsize=2: self.PAGE_SIZE * width * itemsize
+        lens_cpu = lens.cpu()
+        for width, count in (
+            (w(self.K_WIDTH), P * L),
+            (w(self.V_WIDTH), P * L),
+            (w(self.INDEX_WIDTH), P * IL),
+            (w(1, 4), P * IL),
+        ):
+            self.assertEqual(int((lens_cpu == width).sum()), count, f"len entries for width={width}")
+
+    def test_layer_group_pipeline_d2h(self):
+        """Per-group table builds + sparse_copy reproduce the one-shot result.
+
+        k/v layers split into groups [0,3), [3,6), [6,8) with independently
+        chosen index_k/scale slot ranges [0,1), [1,3), (skipped) -- together
+        they must cover every k/v and index_k/scale layer exactly once and
+        match the one-shot AIV transfer element-wise.
+        """
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        self._fill_device(self.buffers)
+
+        # Reference: one-shot AIV D2H.
+        self._run_aiv(self.buffers, TransferDirection.D2H)
+        torch.npu.synchronize()
+        ref = {
+            k: self.buffers[k].clone()
+            for k in ("host_k", "host_v", "host_index_k", "host_scale")
+        }
+        for k in ref:
+            self.buffers[k].zero_()
+
+        # Pipelined: per-group builds + launches (all on one stream, exactly
+        # how the scheduler's layer loop interleaves them).
+        groups = [
+            # (layer_start, layer_num, index_k_layer_start, index_k_layer_num)
+            (0, 3, 0, 1),
+            (3, 3, 1, 2),
+            (6, 2, 0, 0),  # trailing group without indexer layers
+        ]
+        for layer_start, layer_num, ik_start, ik_num in groups:
+            src, dst, lens, size = transfer_kv_dim_exchange_table(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=self.buffers["device_k"],
+                host_k=self.buffers["host_k"],
+                device_v=self.buffers["device_v"],
+                host_v=self.buffers["host_v"],
+                device_index_k=self.buffers["device_index_k"],
+                host_index_k=self.buffers["host_index_k"],
+                device_index_k_scale=self.buffers["device_scale"],
+                host_index_k_scale=self.buffers["host_scale"],
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.D2H,
+                layer_start=layer_start,
+                layer_num=layer_num,
+                index_k_layer_start=ik_start,
+                index_k_layer_num=ik_num,
+            )
+            ret = self.offload.sparse_copy(
+                src, dst, lens, size, torch.device("npu", torch.npu.current_device())
+            )
+            self.assertEqual(ret, 0, "offload.sparse_copy failed")
+            stream = torch.npu.current_stream()
+            for t in (src, dst, lens, size):
+                t.record_stream(stream)
+        torch.npu.synchronize()
+
+        for k, ref_t in ref.items():
+            self.assertTrue(
+                torch.equal(self.buffers[k], ref_t),
+                f"layer-group D2H result differs from one-shot for {k}",
+            )
+
+    def test_layer_group_pipeline_h2d(self):
+        """Same as test_layer_group_pipeline_d2h for the H2D direction."""
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        self._fill_host(self.buffers)
+
+        self._run_aiv(self.buffers, TransferDirection.H2D)
+        torch.npu.synchronize()
+        ref = {
+            k: self.buffers[k].detach().cpu().clone()
+            for k in ("device_k", "device_v", "device_index_k", "device_scale")
+        }
+        for k in ref:
+            self.buffers[k].zero_()
+
+        groups = [(0, 3, 0, 1), (3, 3, 1, 2), (6, 2, 0, 0)]
+        for layer_start, layer_num, ik_start, ik_num in groups:
+            src, dst, lens, size = transfer_kv_dim_exchange_table(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=self.buffers["device_k"],
+                host_k=self.buffers["host_k"],
+                device_v=self.buffers["device_v"],
+                host_v=self.buffers["host_v"],
+                device_index_k=self.buffers["device_index_k"],
+                host_index_k=self.buffers["host_index_k"],
+                device_index_k_scale=self.buffers["device_scale"],
+                host_index_k_scale=self.buffers["host_scale"],
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.H2D,
+                layer_start=layer_start,
+                layer_num=layer_num,
+                index_k_layer_start=ik_start,
+                index_k_layer_num=ik_num,
+            )
+            ret = self.offload.sparse_copy(
+                src, dst, lens, size, torch.device("npu", torch.npu.current_device())
+            )
+            self.assertEqual(ret, 0, "offload.sparse_copy failed")
+            stream = torch.npu.current_stream()
+            for t in (src, dst, lens, size):
+                t.record_stream(stream)
+        torch.npu.synchronize()
+
+        for k, ref_t in ref.items():
+            self.assertTrue(
+                torch.equal(self.buffers[k].cpu(), ref_t),
+                f"layer-group H2D result differs from one-shot for {k}",
+            )
+
+    def test_layer_range_entry_count(self):
+        """Layer ranges shrink the table by exactly the excluded layers."""
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        src, dst, lens, size = transfer_kv_dim_exchange_table(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=self.buffers["device_k"],
+            host_k=self.buffers["host_k"],
+            device_v=self.buffers["device_v"],
+            host_v=self.buffers["host_v"],
+            device_index_k=self.buffers["device_index_k"],
+            host_index_k=self.buffers["host_index_k"],
+            device_index_k_scale=self.buffers["device_scale"],
+            host_index_k_scale=self.buffers["host_scale"],
+            page_size=self.PAGE_SIZE,
+            direction=TransferDirection.D2H,
+            layer_start=2,
+            layer_num=3,
+            index_k_layer_start=1,
+            index_k_layer_num=2,
+        )
+        P = self.NUM_PAGES
+        # k + v: 3 layers; index_k + scale: 2 layers; no row exceeds 88KB.
+        expected = P * 3 + P * 3 + P * 2 + P * 2
+        self.assertEqual(int(size.cpu().item()), expected)
+        self.assertEqual(lens.numel(), expected)
+
+    def test_layer_range_out_of_bounds_rejected(self):
+        self._alloc()
+        device_indices, host_indices, perm = self._indices()
+        self.buffers.update(device_indices=device_indices, host_indices=host_indices, perm=perm)
+        with self.assertRaises(RuntimeError):
+            transfer_kv_dim_exchange_table(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=self.buffers["device_k"],
+                host_k=self.buffers["host_k"],
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.D2H,
+                layer_start=6,   # 6 + 4 > 8 layers
+                layer_num=4,
+            )
+        with self.assertRaises(RuntimeError):
+            transfer_kv_dim_exchange_table(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=self.buffers["device_k"],
+                host_k=self.buffers["host_k"],
+                device_index_k=self.buffers["device_index_k"],
+                host_index_k=self.buffers["host_index_k"],
+                page_size=self.PAGE_SIZE,
+                direction=TransferDirection.D2H,
+                index_k_layer_start=2,  # 2 + 2 > 3 indexer layers
+                index_k_layer_num=2,
+            )
+
+    def test_wide_row_entry_split(self):
+        """Rows wider than the 88KB UB buffer must split into two entries."""
+        P, L, PS, WIDE = 20, 2, 128, 512  # row = 128*512*2B = 128KB -> 2 entries
+        device_k = torch.zeros((L, P, PS, 1, WIDE), dtype=torch.bfloat16, device="npu")
+        host_k = self.offload.empty([P, L, PS, 1, WIDE], dtype=torch.bfloat16).zero_()
+        ref_k = torch.zeros((P, L, PS, 1, WIDE), dtype=torch.bfloat16, device="cpu", pin_memory=True)
+
+        for layer in range(L):
+            for page in range(P):
+                device_k[layer, page].fill_(self._value(layer, page))
+
+        g = torch.Generator().manual_seed(11)
+        perm = torch.randperm(P, generator=g)
+        host_tokens = (perm * PS).repeat_interleave(PS) + torch.arange(PS).repeat(P)
+        device_indices = torch.arange(P * PS, dtype=torch.int64)
+        host_indices = host_tokens.to(device_indices.device)
+
+        transfer_kv_dim_exchange(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=ref_k,
+            device_v=torch.empty(0),
+            host_v=torch.empty(0),
+            page_size=PS,
+            direction=TransferDirection.D2H,
+        )
+        src, dst, lens, size = transfer_kv_dim_exchange_table(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=host_k,
+            page_size=PS,
+            direction=TransferDirection.D2H,
+        )
+        self.assertEqual(int(size.cpu().item()), P * L * 2, "each 128KB row must split into 2 entries")
+        ret = self.offload.sparse_copy(
+            src, dst, lens, size, torch.device("npu", torch.npu.current_device())
+        )
+        self.assertEqual(ret, 0)
+        torch.npu.synchronize()
+        self.assertTrue(torch.equal(host_k, ref_k), "split-entry AIV copy differs from memcpy2d")
+        perm_list = perm.tolist()
+        for layer in range(L):
+            for dp in range(P):
+                self.assertTrue(
+                    torch.all(torch.eq(host_k[perm_list[dp], layer], self._value(layer, dp))),
+                    f"wide-row mismatch at layer={layer} page={dp}",
+                )
 
 
 if __name__ == "__main__":

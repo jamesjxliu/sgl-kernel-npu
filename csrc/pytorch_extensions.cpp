@@ -56,6 +56,16 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "int layer_start=0, int layer_num=-1) -> ()");
 
     m.def(
+        "transfer_kv_dim_exchange_table(Tensor device_k, Tensor host_k, "
+        "Tensor device_v, Tensor host_v, "
+        "Tensor device_index_k, Tensor host_index_k, "
+        "Tensor device_index_k_scale, Tensor host_index_k_scale, "
+        "Tensor device_indices, Tensor host_indices, int page_size, int direction, "
+        "int layer_start=0, int layer_num=-1, "
+        "int index_k_layer_start=0, int index_k_layer_num=-1) "
+        "-> (Tensor, Tensor, Tensor, Tensor)");
+
+    m.def(
         "transfer_mamba_state(Tensor device_buf, Tensor host_buf, "
         "Tensor device_indices, Tensor host_indices, int direction) -> ()");
 
@@ -222,6 +232,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("build_tree_kernel_efficient", TORCH_FN(sglang::npu_kernel::build_tree_efficient));
 
     m.impl("transfer_kv_dim_exchange", TORCH_FN(sglang::npu_kernel::transfer_kv_dim_exchange));
+
+    m.impl("transfer_kv_dim_exchange_table",
+           TORCH_FN(sglang::npu_kernel::transfer_kv_dim_exchange_table));
 
     m.impl("transfer_mamba_state", TORCH_FN(sglang::npu_kernel::transfer_mamba_state));
     m.impl("transfer_state_per_layer_direct_pf_lf",
