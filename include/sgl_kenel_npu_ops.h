@@ -50,6 +50,7 @@ void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
                               at::Tensor &device_v, at::Tensor &host_v,
                               const at::Tensor &device_indices,
                               const at::Tensor &host_indices, int64_t page_size,
+                              int64_t layer_start, int64_t layer_num,
                               int64_t direction, int64_t flags);
 
 void transfer_mamba_state(at::Tensor &device_buf, at::Tensor &host_buf,

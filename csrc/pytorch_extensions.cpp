@@ -52,7 +52,8 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def(
         "transfer_kv_dim_exchange(Tensor device_k, Tensor host_k, "
         "Tensor device_v, Tensor host_v, "
-        "Tensor device_indices, Tensor host_indices, int page_size, int direct, int flags) -> ()");
+        "Tensor device_indices, Tensor host_indices, int page_size, "
+        "int layer_start, int layer_num, int direct, int flags) -> ()");
 
     m.def(
         "transfer_mamba_state(Tensor device_buf, Tensor host_buf, "
